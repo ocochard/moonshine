@@ -5,6 +5,13 @@ resolver = "2"
 [workspace.package]
 version = "0.12.0"
 
+# FreeBSD support in upstream socket-pktinfo (0.3.x/0.4.x) is missing —
+# the crate references Linux-only IP_PKTINFO / struct in_pktinfo. We
+# maintain a local fork on the `freebsd` branch until the upstream PR
+# lands. The override is transparent on Linux.
+[patch.crates-io]
+socket-pktinfo = { path = "vendor/socket-pktinfo" }
+
 [package]
 name = "moonshine"
 version.workspace = true

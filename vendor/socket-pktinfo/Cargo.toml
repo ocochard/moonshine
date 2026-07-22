@@ -1,0 +1,35 @@
+[package]
+name = "socket-pktinfo"
+# Pinned to a 0.3.x version so it satisfies mdns-sd's "^0.3.2" requirement
+# via [patch.crates-io]. The source is a fork of upstream 0.4.0 plus the
+# FreeBSD/BSD IPv4 PKTINFO backport (IP_RECVDSTADDR + IP_RECVIF).
+version = "0.3.99"
+authors = ["pixsperdavid <david@pixsper.com>"]
+edition = "2018"
+rust-version = "1.71.0"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/pixsper/socket-pktinfo"
+repository = "https://github.com/pixsper/socket-pktinfo"
+documentation = "https://docs.rs/socket-pktinfo"
+keywords = ["sockets", "udp", "ip_pktinfo", "multicast"]
+categories = ["network-programming"]
+description = "Small library to allow cross-platform handling of IP_PKTINFO and IPV6_PKTINFO with socket2 crate"
+
+[dependencies.socket2]
+version = "0.6"
+features = ["all"]
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO"
+]
+
+[target.'cfg(not(windows))'.dependencies.libc]
+version = "0.2.177"
+
+[dev-dependencies.network-interface]
+version = "2.0.3"
