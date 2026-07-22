@@ -1,15 +1,26 @@
-use inputtino::{
-	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
-	SwitchJoypad, XboxOneJoypad,
-};
 use serde::{Deserialize, Serialize};
 use strum_macros::FromRepr;
-use tokio::sync::mpsc;
 
-use crate::session::stream::control::{
-	FeedbackCommand,
-	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
-};
+#[cfg(target_os = "linux")]
+mod backend_inputtino;
+#[cfg(target_os = "linux")]
+pub(crate) use backend_inputtino::Gamepad;
+
+#[cfg(not(target_os = "linux"))]
+mod backend_stub;
+#[cfg(not(target_os = "linux"))]
+pub(crate) use backend_stub::Gamepad;
+
+/// Motion sensor kind reported by the client. Values match the wire protocol
+/// (see `GamepadMotion::from_bytes`) and the LiUsbHidGamepadMotionType constants
+/// used by Moonlight. Kept independent of the input backend so the wire parser
+/// stays portable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum MotionType {
+	Acceleration = 1,
+	Gyroscope = 2,
+}
 
 /// Configuration for the hold-to-Home gamepad button remap.
 ///
@@ -98,7 +109,7 @@ enum GamepadCapability {
 #[derive(Debug)]
 pub(crate) struct GamepadInfo {
 	pub index: u8,
-	kind: GamepadKind,
+	pub(super) kind: GamepadKind,
 	capabilities: u16,
 	_supported_buttons: u32,
 }
@@ -149,7 +160,7 @@ pub(crate) struct GamepadTouch {
 	pub index: u8,
 	_event_type: u8,
 	// zero: [u8; 2], // Alignment/reserved
-	pointer_id: u32,
+	pub(super) pointer_id: u32,
 	pub x: f32,
 	pub y: f32,
 	pub pressure: f32,
@@ -192,10 +203,10 @@ pub(crate) struct GamepadUpdate {
 	pub index: u16,
 	pub active_gamepad_mask: u16,
 	button_flags: u32,
-	left_trigger: u8,
-	right_trigger: u8,
-	left_stick: (i16, i16),
-	right_stick: (i16, i16),
+	pub(super) left_trigger: u8,
+	pub(super) right_trigger: u8,
+	pub(super) left_stick: (i16, i16),
+	pub(super) right_stick: (i16, i16),
 }
 
 impl GamepadUpdate {
@@ -251,11 +262,11 @@ impl GamepadUpdate {
 #[derive(Debug)]
 pub(crate) struct GamepadMotion {
 	pub index: u8,
-	motion_type: JoypadMotionType,
+	pub(crate) motion_type: MotionType,
 	// zero: [u8; 2], // Alignment/reserved
-	x: f32,
-	y: f32,
-	z: f32,
+	pub(crate) x: f32,
+	pub(crate) y: f32,
+	pub(crate) z: f32,
 }
 
 impl GamepadMotion {
@@ -280,8 +291,8 @@ impl GamepadMotion {
 		Ok(Self {
 			index: buffer[0],
 			motion_type: match buffer[1] {
-				1 => JoypadMotionType::ACCELERATION,
-				2 => JoypadMotionType::GYROSCOPE,
+				1 => MotionType::Acceleration,
+				2 => MotionType::Gyroscope,
 				_ => {
 					tracing::warn!("Unknown gamepad motion type: {}", buffer[1]);
 					return Err(());
@@ -297,7 +308,7 @@ impl GamepadMotion {
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
-enum BatteryState {
+pub(super) enum BatteryState {
 	Unknown = 0x00,
 	NotPresent = 0x01,
 	Discharging = 0x02,
@@ -310,8 +321,8 @@ enum BatteryState {
 #[derive(Debug)]
 pub(crate) struct GamepadBattery {
 	pub index: u8,
-	battery_state: BatteryState,
-	battery_percentage: u8,
+	pub(super) battery_state: BatteryState,
+	pub(super) battery_percentage: u8,
 }
 
 impl GamepadBattery {
@@ -340,187 +351,5 @@ impl GamepadBattery {
 	}
 }
 
-pub(crate) struct Gamepad {
-	/// The underlying inputtino joypad, used to inject button presses, stick
-	/// positions, triggers, touchpad events, and motion data.
-	gamepad: inputtino::Joypad,
-}
-
-impl Gamepad {
-	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
-		let id = format!("00:11:22:33:{:02x}", info.index);
-		let definition = match info.kind {
-			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
-				"Moonshine XOne controller",
-				0x045e,
-				0x02dd,
-				0x0100,
-				id.as_str(),
-				id.as_str(),
-			),
-			GamepadKind::PlayStation => DeviceDefinition::new(
-				"Moonshine PS5 controller",
-				0x054C,
-				0x0CE6,
-				0x8111,
-				id.as_str(),
-				id.as_str(),
-			),
-			GamepadKind::Nintendo => DeviceDefinition::new(
-				"Moonshine Switch controller",
-				0x057e,
-				0x2009,
-				0x8111,
-				id.as_str(),
-				id.as_str(),
-			),
-		};
-
-		let mut gamepad = match info.kind {
-			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(
-				XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
-			),
-			GamepadKind::PlayStation => {
-				let mut gamepad =
-					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
-
-				gamepad.set_on_led({
-					let feedback_tx = feedback_tx.clone();
-					let index = info.index;
-					move |r, g, b| {
-						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
-							id: index as u16,
-							rgb: (r as u8, g as u8, b as u8),
-						}));
-					}
-				});
-
-				gamepad.set_on_trigger_effect({
-					let feedback_tx = feedback_tx.clone();
-					let index = info.index;
-					move |trigger_event_flags, type_left, type_right, left, right| {
-						let left: &[u8; 10] = if let Ok(left) = left.try_into() {
-							left
-						} else {
-							tracing::warn!("Couldn't convert left trigger effect.");
-							return;
-						};
-
-						let right: &[u8; 10] = if let Ok(right) = right.try_into() {
-							right
-						} else {
-							tracing::warn!("Couldn't convert right trigger effect.");
-							return;
-						};
-
-						// tracing::info!("Trigger effect: {:?} {:?} {:?} {:?}", type_left, type_right, left, right);
-
-						let _ = feedback_tx.blocking_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
-							id: index as u16,
-							trigger_event_flags,
-							type_left,
-							type_right,
-							left: left.to_owned(),
-							right: right.to_owned(),
-						}));
-					}
-				});
-
-				// Enable gyro and accelerometer events.
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-						id: info.index as u16,
-						report_rate: 100,
-						motion_type: JoypadMotionType::ACCELERATION as u8,
-					}))
-					.await;
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-						id: info.index as u16,
-						report_rate: 100,
-						motion_type: JoypadMotionType::GYROSCOPE as u8,
-					}))
-					.await;
-
-				Joypad::PS5(gamepad)
-			},
-			GamepadKind::Nintendo => Joypad::Switch(
-				SwitchJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
-			),
-		};
-
-		let feedback_tx_for_rumble = feedback_tx.clone();
-		gamepad.set_on_rumble({
-			let index = info.index;
-			move |low_frequency, high_frequency| {
-				let _ = feedback_tx_for_rumble.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
-					id: index as u16,
-					low_frequency: low_frequency as u16,
-					high_frequency: high_frequency as u16,
-				}));
-			}
-		});
-
-		Ok(Self { gamepad })
-	}
-
-	/// Apply button flags to the gamepad.
-	pub fn set_pressed(&self, button_flags: u32) {
-		self.gamepad.set_pressed(button_flags as i32);
-	}
-
-	/// Apply a gamepad update (sticks, triggers) to the device.
-	pub fn apply_update(&self, update: &GamepadUpdate) {
-		// Send analog triggers.
-		self.gamepad
-			.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
-		self.gamepad
-			.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
-		self.gamepad
-			.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
-	}
-
-	pub fn touch(&mut self, touch: &GamepadTouch) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
-			if touch.pressure > 0.5 {
-				gamepad.place_finger(
-					touch.pointer_id,
-					(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
-					(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
-				);
-			} else {
-				gamepad.release_finger(touch.pointer_id);
-			}
-		}
-	}
-
-	pub fn set_motion(&self, motion: &GamepadMotion) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
-			gamepad.set_motion(
-				motion.motion_type,
-				motion.x.to_radians(),
-				motion.y.to_radians(),
-				motion.z.to_radians(),
-			);
-		}
-	}
-
-	pub fn set_battery(&self, gamepad_battery: &GamepadBattery) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
-			let state = match gamepad_battery.battery_state {
-				BatteryState::Discharging => InputtinoBatterState::BATTERY_DISCHARGING,
-				BatteryState::Charging => InputtinoBatterState::BATTERY_CHARGHING,
-				BatteryState::Full => InputtinoBatterState::BATTERY_FULL,
-				BatteryState::NotPresent => return,
-				BatteryState::NotCharging => return,
-				BatteryState::Unknown => return,
-				_ => {
-					tracing::warn!("Unknown battery state: {:?}", gamepad_battery.battery_state);
-					return;
-				},
-			};
-
-			gamepad.set_battery(state, gamepad_battery.battery_percentage);
-		}
-	}
-}
+// `Gamepad` lives in the backend submodule (`backend_inputtino` on Linux,
+// `backend_stub` elsewhere). See the `use` at the top of this file.
