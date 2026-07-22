@@ -1,3 +1,4 @@
+mod audio_clock;
 mod commands;
 mod dyn_buffer;
 
@@ -6,6 +7,8 @@ use std::io::{Cursor, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time;
+
+use audio_clock::AudioClock;
 
 use async_shutdown::ShutdownManager;
 use bytes::{Buf, BytesMut};
@@ -149,7 +152,7 @@ struct ServerState {
 pub(crate) struct PulseServer {
 	listener: UnixListener,
 	poll: mio::Poll,
-	clock: mio_timerfd::TimerFd,
+	clock: AudioClock,
 	clock_rate_hz: u32,
 
 	frame_tx: crossbeam_channel::Sender<AudioFrame>,
@@ -212,8 +215,7 @@ impl PulseServer {
 			},
 		};
 
-		let mut clock = mio_timerfd::TimerFd::new(mio_timerfd::ClockId::Monotonic)?;
-		clock.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / clock_rate_hz as u64))?;
+		let clock = AudioClock::new(time::Duration::from_nanos(1_000_000_000 / clock_rate_hz as u64))?;
 
 		let sink_name = std::ffi::CString::new(SINK_NAME).unwrap();
 
@@ -370,7 +372,7 @@ impl PulseServer {
 					CLOCK => {
 						// A wakeup can race its own drain and find no expirations
 						// left to read (EAGAIN); skip the tick, don't kill the session.
-						match self.clock.read() {
+						match self.clock.drain() {
 							Ok(_) => self.clock_tick()?,
 							Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
 							Err(e) => return Err(e.into()),
