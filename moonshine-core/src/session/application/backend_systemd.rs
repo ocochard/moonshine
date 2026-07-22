@@ -1,78 +1,14 @@
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use zbus::proxy::SignalStream;
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
 use zvariant::OwnedObjectPath;
 
-pub fn default_launch_timeout() -> u64 {
-	2
-}
-
-/// Configuration for a single application that can be launched in a session.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ApplicationConfig {
-	/// Title of the application.
-	pub title: String,
-
-	/// Path to a boxart image.
-	pub boxart: Option<PathBuf>,
-
-	/// The command to run.
-	pub command: Vec<String>,
-
-	/// Commands to run before launching the application.
-	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub pre_command: Vec<Vec<String>>,
-
-	/// Commands to run after the streaming session ends.
-	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub post_command: Vec<Vec<String>>,
-
-	/// systemd StandardOutput value. If not set, defaults to "null".
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stdout: Option<String>,
-
-	/// systemd StandardError value. If not set, defaults to "null".
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stderr: Option<String>,
-
-	/// Seconds to wait for the application to reach an active state after launch.
-	#[serde(default = "default_launch_timeout")]
-	pub launch_timeout_secs: u64,
-}
-
-impl Default for ApplicationConfig {
-	fn default() -> Self {
-		Self {
-			title: String::new(),
-			boxart: None,
-			command: Vec::new(),
-			pre_command: Vec::new(),
-			post_command: Vec::new(),
-			stdout: None,
-			stderr: None,
-			launch_timeout_secs: default_launch_timeout(),
-		}
-	}
-}
-
-impl ApplicationConfig {
-	pub fn id(&self) -> i32 {
-		let mut hasher = DefaultHasher::new();
-		self.title.hash(&mut hasher);
-		// Clients only accept non-negative application IDs.
-		(hasher.finish() as i32) & i32::MAX
-	}
-}
-
+use super::{make_envs, ApplicationConfig, ApplicationContext};
 use crate::session::manager::SessionShutdownReason;
 
 const SYSTEMD_BUS: &str = "org.freedesktop.systemd1";
@@ -115,22 +51,6 @@ pub(crate) struct LaunchOptions<'a> {
 	pub stderr_value: &'a Option<String>,
 }
 
-/// Runtime context required to launch an application.
-pub(crate) struct ApplicationContext {
-	/// systemd transient unit name (e.g. `"moonshine-session.service"`).
-	pub unit_name: String,
-	/// Path to the PulseAudio socket created by the audio stream.
-	pub pulse_socket_path: PathBuf,
-	/// X11 display number reported by XWayland (e.g. `0` → `":0"`).
-	pub xdisplay: u32,
-	/// Wayland socket name reported by the compositor.
-	pub wayland_display: String,
-	/// Effective HDR mode — `true` only when the compositor confirmed an HDR-capable DMA-BUF format is in use.
-	pub hdr: bool,
-	/// Environment variables to pass on.
-	pub extra_env: HashMap<String, String>,
-}
-
 pub(crate) struct Application {
 	unit_name: String,
 	config: ApplicationConfig,
@@ -156,7 +76,6 @@ impl Application {
 		let conn = Connection::session()
 			.await
 			.map_err(|e| tracing::error!("Failed to connect to session bus: {e}"))?;
-		subscribe_to_systemd_signals(&conn).await?;
 
 		// Stop any leftover unit from a previous session.
 		let _ = stop_unit(&conn, &context.unit_name).await;
@@ -208,60 +127,6 @@ impl Drop for Application {
 		.join()
 		.unwrap();
 	}
-}
-
-/// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
-	// Build environment variables as "KEY=value" strings for systemd.
-	let mut envs: Vec<String> = vec![
-		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
-		format!(
-			"PULSE_RUNTIME_PATH={}",
-			context
-				.pulse_socket_path
-				.parent()
-				.ok_or_else(|| tracing::error!("Failed to get parent directory of PulseAudio socket."))?
-				.to_string_lossy()
-		),
-		format!("DISPLAY=:{}", context.xdisplay),
-		format!("WAYLAND_DISPLAY={}", context.wayland_display),
-		format!("MOONSHINE_WAYLAND_DISPLAY={}", context.wayland_display),
-		// Activate the moonshine WSI Vulkan layer.
-		"ENABLE_MOONSHINE_WSI=1".to_string(),
-		// Force Proton to use winepulse.drv instead of winepipewire.drv,
-		// so it respects PULSE_SERVER and routes audio through Moonshine.
-		"PROTON_USE_PIPEWIRE=0".to_string(),
-	];
-
-	// Impersonate gamescope so Steam uses its external-overlay mode.
-	envs.push("XDG_CURRENT_DESKTOP=gamescope".to_string());
-	envs.push(format!("GAMESCOPE_WAYLAND_DISPLAY={}", context.wayland_display));
-	envs.push(format!("STEAM_GAME_DISPLAY_0=:{}", context.xdisplay));
-	// Steam keys gamescope features (HDR, VRR, scaling, FPS limit) off these.
-	envs.push("STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1".to_string());
-	envs.push("STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1".to_string());
-	envs.push("STEAM_GAMESCOPE_NIS_SUPPORTED=1".to_string());
-	envs.push("STEAM_GAMESCOPE_VRR_SUPPORTED=1".to_string());
-	if context.hdr {
-		envs.push("STEAM_GAMESCOPE_HDR_SUPPORTED=1".to_string());
-	}
-
-	if context.hdr {
-		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
-		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
-		// games will not see HDR as available.
-		envs.push("DXVK_HDR=1".to_string());
-		// Signal HDR mode to the moonshine-wsi layer so it can advertise HDR
-		// surface formats correctly (the factory global is always present for
-		// SDR sessions too, so we need an explicit capability signal).
-		envs.push("MOONSHINE_HDR=1".to_string());
-	}
-
-	for (key, value) in &context.extra_env {
-		envs.push(format!("{key}={value}"));
-	}
-
-	Ok(envs)
 }
 
 /// Wait for a `JobRemoved` signal matching the given job path, accepting only `"done"` as success.
@@ -392,7 +257,6 @@ async fn stop_unit_owned(unit_name: String) -> Result<(), ()> {
 	let conn = Connection::session().await.map_err(|e| {
 		tracing::error!("Failed to connect to session bus: {e}");
 	})?;
-	subscribe_to_systemd_signals(&conn).await?;
 	stop_unit(&conn, &unit_name).await
 }
 
@@ -470,10 +334,11 @@ async fn wait_for_unit_terminal_state(
 				if iface != UNIT_INTERFACE {
 					continue;
 				}
-				if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY)
-					&& let Some(state) = terminal_state(state.as_str()) {
+				if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY) {
+					if let Some(state) = terminal_state(state.as_str()) {
 						return Ok(state.to_string());
 					}
+				}
 			},
 			message = unit_removed_stream.next() => {
 				let Some(message) = message else {
@@ -521,31 +386,6 @@ fn terminal_state(state: &str) -> Option<&'static str> {
 	}
 }
 
-/// Split a systemd `StandardOutput`/`StandardError` setting into the enum value
-/// and, for path-based settings, the companion path property.
-///
-/// Unit files accept `StandardOutput=file:/path`, but over D-Bus
-/// (StartTransientUnit) the path must go in a separate property:
-/// `StandardOutput=file` + `StandardOutputFile=/path`. Sending the combined
-/// `file:/path` string is rejected with "Invalid StandardOutput setting".
-/// Mirrors systemd's `bus_append_standard_inputs()` in bus-unit-util.c.
-fn split_standard_io(value: &Option<String>) -> (String, Option<(&'static str, String)>) {
-	let Some(v) = value.as_deref() else {
-		return ("null".to_string(), None);
-	};
-	for (prefix, prop) in [
-		("file:", "File"),
-		("append:", "FileToAppend"),
-		("truncate:", "FileToTruncate"),
-		("fd:", "FileDescriptorName"),
-	] {
-		if let Some(path) = v.strip_prefix(prefix) {
-			return (v[..prefix.len() - 1].to_string(), Some((prop, path.to_string())));
-		}
-	}
-	(v.to_string(), None)
-}
-
 /// Launch the application as a transient systemd service unit via D-Bus.
 async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<OwnedObjectPath, ()> {
 	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
@@ -570,53 +410,40 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 
 	tracing::debug!(?pre_entries, ?main_entry, ?post_entries, "Building transient service");
 
-	// Split StandardOutput/StandardError into the enum value plus an optional
-	// companion path property. Unit-file syntax (`StandardOutput=file:/path`) is
-	// not accepted over D-Bus; the path must be a separate property
-	// (`StandardOutput=file` + `StandardOutputFile=/path`).
-	let (stdout_setting, stdout_path) = split_standard_io(options.stdout_value);
-	let (stderr_setting, stderr_path) = split_standard_io(options.stderr_value);
-
 	// Properties: a(sv) — array of (property_name: s, value: v)
-	// zvariant::Value has D-Bus type 'v' (variant), so Vec<(String, Value)> serialises as a(sv).
+	// zvariant::Value has D-Bus type 'v' (variant), so Vec<(&str, Value)> serialises as a(sv).
 	//
 	// IMPORTANT: do NOT use zvariant::Array::from(Vec<Value>) — it always produces `av`
 	// (array of variant). Build typed arrays with Array::new(signature) + append() instead.
-	let mut properties: Vec<(String, zvariant::Value<'_>)> = vec![
-		("Type".to_string(), zvariant::Value::Str("exec".into())),
-		("Slice".to_string(), zvariant::Value::Str("moonshine.slice".into())),
+	let mut properties: Vec<(&str, zvariant::Value<'_>)> = vec![
+		("Type", zvariant::Value::Str("exec".into())),
+		("Slice", zvariant::Value::Str("moonshine.slice".into())),
 		// Environment: as
-		("Environment".to_string(), zvariant::Value::from(options.envs.to_vec())),
+		("Environment", zvariant::Value::from(options.envs.to_vec())),
 		// ExecStart: a(sasb)
-		("ExecStart".to_string(), build_exec_array(&[main_entry])?),
-		("TimeoutStopUSec".to_string(), zvariant::Value::U64(5_000_000)),
+		("ExecStart", build_exec_array(&[main_entry])?),
+		("TimeoutStopUSec", zvariant::Value::U64(5_000_000)),
+		("CollectMode", zvariant::Value::Str("inactive-or-failed".into())),
+		// StandardOutput/StandardError: systemd expects `s` (string)
+		// Valid values: inherit, null, tty, journal, kmsg, journal+console,
+		// file:path, append:path, truncate:path, socket, fd:name
 		(
-			"CollectMode".to_string(),
-			zvariant::Value::Str("inactive-or-failed".into()),
+			"StandardOutput",
+			zvariant::Value::Str(options.stdout_value.as_deref().unwrap_or("null").into()),
 		),
-		// StandardOutput/StandardError: bare enum value
 		(
-			"StandardOutput".to_string(),
-			zvariant::Value::Str(stdout_setting.into()),
+			"StandardError",
+			zvariant::Value::Str(options.stderr_value.as_deref().unwrap_or("null").into()),
 		),
-		("StandardError".to_string(), zvariant::Value::Str(stderr_setting.into())),
 	];
-
-	// Path-based outputs carry their path in a companion property.
-	if let Some((prop, path)) = stdout_path {
-		properties.push((format!("StandardOutput{prop}"), zvariant::Value::Str(path.into())));
-	}
-	if let Some((prop, path)) = stderr_path {
-		properties.push((format!("StandardError{prop}"), zvariant::Value::Str(path.into())));
-	}
 
 	// Only include ExecStartPre/ExecStopPost when non-empty: an empty a(sasb) array still
 	// needs a valid element signature, and omitting absent properties is cleaner.
 	if !pre_entries.is_empty() {
-		properties.push(("ExecStartPre".to_string(), build_exec_array(&pre_entries)?));
+		properties.push(("ExecStartPre", build_exec_array(&pre_entries)?));
 	}
 	if !post_entries.is_empty() {
-		properties.push(("ExecStopPost".to_string(), build_exec_array(&post_entries)?));
+		properties.push(("ExecStopPost", build_exec_array(&post_entries)?));
 	}
 
 	// Aux units: empty a(sa(sv))
@@ -771,64 +598,4 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 			.map_err(|e| tracing::error!("Failed to append exec entry: {e}"))?;
 	}
 	Ok(zvariant::Value::Array(arr))
-}
-
-#[cfg(test)]
-mod tests {
-	use super::split_standard_io;
-
-	#[test]
-	fn test_standard_io_defaults_to_null() {
-		assert_eq!(split_standard_io(&None), ("null".to_string(), None));
-	}
-
-	#[test]
-	fn test_standard_io_passes_bare_enums_through() {
-		assert_eq!(
-			split_standard_io(&Some("journal".to_string())),
-			("journal".to_string(), None)
-		);
-		assert_eq!(
-			split_standard_io(&Some("inherit".to_string())),
-			("inherit".to_string(), None)
-		);
-		assert_eq!(
-			split_standard_io(&Some("kmsg+console".to_string())),
-			("kmsg+console".to_string(), None)
-		);
-	}
-
-	#[test]
-	fn test_standard_io_splits_file_paths() {
-		assert_eq!(
-			split_standard_io(&Some("file:/var/log/app.log".to_string())),
-			("file".to_string(), Some(("File", "/var/log/app.log".to_string())))
-		);
-	}
-
-	#[test]
-	fn test_standard_io_splits_append_and_truncate() {
-		assert_eq!(
-			split_standard_io(&Some("append:/var/log/app.log".to_string())),
-			(
-				"append".to_string(),
-				Some(("FileToAppend", "/var/log/app.log".to_string()))
-			)
-		);
-		assert_eq!(
-			split_standard_io(&Some("truncate:/var/log/app.log".to_string())),
-			(
-				"truncate".to_string(),
-				Some(("FileToTruncate", "/var/log/app.log".to_string()))
-			)
-		);
-	}
-
-	#[test]
-	fn test_standard_io_splits_fd_names() {
-		assert_eq!(
-			split_standard_io(&Some("fd:stdout".to_string())),
-			("fd".to_string(), Some(("FileDescriptorName", "stdout".to_string())))
-		);
-	}
 }
