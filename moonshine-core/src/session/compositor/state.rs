@@ -640,6 +640,22 @@ impl MoonshineCompositor {
 			self.last_cursor_position = self.cursor_position;
 		}
 
+		// Dispatch wl_surface.frame callbacks BEFORE any potential early
+		// return. Without this, a client (game) that commits its initial
+		// buffers and then waits for its frame callback would block forever
+		// if this function early-returns via the keepalive throttle, the
+		// buffer-in-use skip, or any render/export error path. That's the
+		// initial /launch race: the game commits ~5 buffers, all early
+		// ticks early-return, the game never sees a callback, stops
+		// committing, and the compositor has nothing to render or export.
+		//
+		// Callbacks are cheap — they enqueue a `wl_callback.done` event
+		// per surface — and firing them at 60Hz regardless of encode
+		// progress lets the game maintain its normal frame-production
+		// cadence. When we do successfully render+export, the game's next
+		// commit is already in flight.
+		self.dispatch_frame_callbacks();
+
 		// Skip rendering when the screen is static and we already sent a
 		// keepalive frame within the last second.
 		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
@@ -688,15 +704,30 @@ impl MoonshineCompositor {
 			}
 		}
 
-		// Pick the next buffer from the pre-allocated pool.
-		let idx = self.next_buffer_index;
-		let slot = &self.buffer_pool[idx];
-		if !slot.consumed.load(Ordering::Acquire) {
-			// The encoder is still reading this buffer — skip the frame
-			// to avoid overwriting its content.
-			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
-			return;
-		}
+		// Pick the next free buffer from the pre-allocated pool. Scan all
+		// slots starting at the round-robin cursor rather than only
+		// checking the cursor's slot: if a single slot is stuck (encoder
+		// slow or absent), a one-slot check would pin the cursor to it
+		// forever and never use the other free slots.
+		let idx = {
+			let mut found = None;
+			for step in 0..BUFFER_POOL_SIZE {
+				let candidate = (self.next_buffer_index + step) % BUFFER_POOL_SIZE;
+				if self.buffer_pool[candidate].consumed.load(Ordering::Acquire) {
+					found = Some(candidate);
+					break;
+				}
+			}
+			match found {
+				Some(candidate) => candidate,
+				None => {
+					// Every slot still held by the encoder — skip this
+					// frame to avoid overwriting a buffer being read.
+					tracing::trace!("All buffers still in use by encoder, skipping frame");
+					return;
+				}
+			}
+		};
 
 		// Mark the buffer as in-use before rendering.
 		self.buffer_pool[idx].consumed.store(false, Ordering::Release);
@@ -889,7 +920,15 @@ impl MoonshineCompositor {
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
+	}
 
+	/// Send `wl_surface.frame` callbacks to all clients and drain the
+	/// override surface's presentation-feedback queue. Called from the top
+	/// of `render_and_export` so clients (games) unblock on their
+	/// wl_callback wait regardless of whether the compositor's render+export
+	/// path early-returns this tick. Also called by the direct-scanout paths
+	/// after their own send.
+	fn dispatch_frame_callbacks(&mut self) {
 		// Send frame callbacks to clients so they know to submit the
 		// next buffer.
 		self.space.elements().for_each(|window| {
@@ -900,6 +939,35 @@ impl MoonshineCompositor {
 				|_, _| Some(self.output.clone()),
 			);
 		});
+
+		// Drain wp_presentation_feedback for every space window. Xwayland
+		// forwards X11 Present requests over Wayland via this protocol,
+		// and games using SwapBuffers block on the corresponding
+		// `presented` events. Without this drain on the composited path,
+		// the feedback queue grows unanswered and Xwayland stops accepting
+		// the game's next SwapBuffers.
+		let space_windows: Vec<_> = self.space.elements().cloned().collect();
+		if !space_windows.is_empty() {
+			let mut feedback = OutputPresentationFeedback::new(&self.output);
+			for window in &space_windows {
+				window.take_presentation_feedback(
+					&mut feedback,
+					|_, _| Some(self.output.clone()),
+					|_, _| smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
+				);
+			}
+			let frame_period = self
+				.output
+				.preferred_mode()
+				.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+				.unwrap_or(std::time::Duration::from_millis(11));
+			feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+				self.clock.now(),
+				Refresh::Fixed(frame_period),
+				0,
+				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
+			);
+		}
 
 		// Also send frame callbacks to the override surface if active,
 		// so the NVIDIA driver's Wayland WSI unblocks and presents the
