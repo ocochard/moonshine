@@ -330,7 +330,12 @@ impl VideoPipelineInner {
 		let ctx = &self.context;
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
-		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+		// Warm the FEC encoder cache off-thread so the encode loop can start
+		// immediately. In a debug build this build is ~37s; running it inline
+		// here is the /launch black-screen race. The lazy get_fec_encoder path
+		// covers the first frames until the merge below lands.
+		let mut warm_up_handle =
+			Some(Packetizer::warm_up_async(self.config.fec_percentage, ctx.minimum_fec_packets));
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
 
@@ -375,6 +380,17 @@ impl VideoPipelineInner {
 		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			// Merge the off-thread FEC warm-up once it finishes, without
+			// blocking the loop. is_finished() lets us poll cheaply each tick.
+			if warm_up_handle.as_ref().is_some_and(|h| h.is_finished()) {
+				if let Some(handle) = warm_up_handle.take() {
+					match handle.join() {
+						Ok(warmed) => packetizer.merge_warm_up(warmed),
+						Err(_) => tracing::warn!("FEC warm-up thread panicked; relying on lazy encoder creation."),
+					}
+				}
+			}
+
 			let mut pending_idr = false;
 
 			// Drain any pending stream-reset requests (client reconnect/resume).
