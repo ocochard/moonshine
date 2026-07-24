@@ -18,6 +18,7 @@ use pulseaudio::protocol::{self as pulse};
 use dyn_buffer::DynPlaybackBuffer;
 
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::audio::frame::{AudioFrame, CAPTURE_SAMPLE_RATE};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -29,8 +30,6 @@ const CLOCK: mio::Token = mio::Token(1);
 /// the buffer grow unboundedly, and the session survives.
 const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
 
-/// The server emits samples at this rate to the encoder.
-pub(crate) const CAPTURE_SAMPLE_RATE: u32 = 48000;
 
 /// Clock tick rate. Determines audio frame size sent to the encoder.
 /// For 5ms frames: 200 Hz; for 10ms frames: 100 Hz.
@@ -40,15 +39,6 @@ const SINK_NAME: &str = "moonshine";
 
 /// Pre-allocated zero-volume slice for muted streams (up to 8 channels).
 const ZERO_VOL: [f32; 8] = [0.0; 8];
-
-/// A buffer of interleaved f32 samples ready for Opus encoding.
-pub(crate) struct AudioFrame {
-	/// Interleaved f32 samples for the negotiated channel count.
-	pub buf: Vec<f32>,
-
-	/// Capture timestamp in milliseconds since process start.
-	pub capture_ts_ms: u64,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamState {
