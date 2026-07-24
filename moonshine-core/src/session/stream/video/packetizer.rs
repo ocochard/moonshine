@@ -159,21 +159,34 @@ impl Packetizer {
 		tracing::debug!("Video encryption cipher updated for key_id={}", self.last_key_id);
 	}
 
-	/// Pre-create FEC encoders for all possible block sizes to avoid
-	/// expensive ReedSolomon matrix construction during frame processing.
-	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32) {
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
+	/// Spawn a background thread that pre-creates FEC encoders for all
+	/// possible block sizes, returning a handle to the resulting map.
+	///
+	/// Building the full cache is ~213 `ReedSolomon::new()` GF(256) matrix
+	/// inversions; in a debug build that serializes to tens of seconds. Doing
+	/// it inline before the encode loop starts is the /launch black-screen
+	/// race. Instead run it off-thread: the encode loop starts immediately,
+	/// `get_fec_encoder` fills any missing entries lazily for the first few
+	/// frames, and the caller merges this map in via [`merge_warm_up`] once
+	/// the thread finishes.
+	pub fn warm_up_async(
+		fec_percentage: u8,
+		minimum_fec_packets: u32,
+	) -> std::thread::JoinHandle<HashMap<(usize, usize), ReedSolomon>> {
+		std::thread::Builder::new()
+			.name("fec-warmup".into())
+			.spawn(move || build_fec_encoders(fec_percentage, minimum_fec_packets))
+			.expect("Failed to spawn FEC warm-up thread")
+	}
 
-		for nr_data_shards in 1..=nr_data_shards_per_block {
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
-			if nr_parity_shards > 0 {
-				let _ = self.get_fec_encoder(nr_data_shards, nr_parity_shards);
-			}
+	/// Fold a pre-built FEC encoder map (from [`warm_up_async`]) into the
+	/// live cache. Entries already created lazily by `get_fec_encoder` win —
+	/// they're identical matrices, and keeping them avoids replacing an
+	/// encoder that may hold a warmed decode-matrix cache.
+	pub fn merge_warm_up(&mut self, warmed: HashMap<(usize, usize), ReedSolomon>) {
+		for (key, encoder) in warmed {
+			self.fec_encoders.entry(key).or_insert(encoder);
 		}
-
 		tracing::debug!("FEC encoder cache warmed with {} entries.", self.fec_encoders.len());
 	}
 
@@ -445,4 +458,27 @@ impl Packetizer {
 			},
 		})
 	}
+}
+
+/// Build the full FEC encoder cache for the given parameters. Pure CPU work
+/// (no `self`) so it can run on a background thread; see [`Packetizer::warm_up_async`].
+fn build_fec_encoders(fec_percentage: u8, minimum_fec_packets: u32) -> HashMap<(usize, usize), ReedSolomon> {
+	let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
+	let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
+
+	let mut encoders = HashMap::new();
+	for nr_data_shards in 1..=nr_data_shards_per_block {
+		let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
+			.max(minimum_fec_packets as usize)
+			.min(MAX_SHARDS.saturating_sub(nr_data_shards));
+		if nr_parity_shards > 0 {
+			match ReedSolomon::new(nr_data_shards, nr_parity_shards) {
+				Ok(encoder) => {
+					encoders.insert((nr_data_shards, nr_parity_shards), encoder);
+				},
+				Err(e) => tracing::warn!("Couldn't create error correction encoder: {e}"),
+			}
+		}
+	}
+	encoders
 }

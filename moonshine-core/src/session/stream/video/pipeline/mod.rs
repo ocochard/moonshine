@@ -6,11 +6,13 @@
 mod dmabuf;
 mod hdr_sei;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use ash::vk;
+use fec_rs::ReedSolomon;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
@@ -252,9 +254,15 @@ async fn run_packet_consumer(
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
 	mut packetizer: Packetizer,
+	warm_up_handle: std::thread::JoinHandle<HashMap<(usize, usize), ReedSolomon>>,
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
 ) {
+	// The FEC cache is built off-thread (see `warm_up_async`) so the encode loop
+	// can start at frame 0 immediately. Merge it here — this task owns the
+	// packetizer — without blocking: `is_finished()` polls cheaply per frame, and
+	// the lazy `get_fec_encoder` path covers anything not yet merged.
+	let mut warm_up_handle = Some(warm_up_handle);
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
@@ -264,6 +272,16 @@ async fn run_packet_consumer(
 	// Driven by the message channel: one `Frame` per submitted frame. When the
 	// encoding thread drops its sender, this loop ends after the last frame.
 	while let Some(msg) = ctx_rx.recv().await {
+		// Merge the off-thread FEC warm-up once it finishes, without blocking.
+		if warm_up_handle.as_ref().is_some_and(|h| h.is_finished()) {
+			if let Some(handle) = warm_up_handle.take() {
+				match handle.join() {
+					Ok(warmed) => packetizer.merge_warm_up(warmed),
+					Err(_) => tracing::warn!("FEC warm-up thread panicked; relying on lazy encoder creation."),
+				}
+			}
+		}
+
 		let (frame_context, future) = match msg {
 			ConsumerMessage::ResetCounters => {
 				frame_number = 0;
@@ -603,7 +621,11 @@ impl VideoPipelineInner {
 		let ctx = &self.context;
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
-		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+		// Warm the FEC encoder cache off-thread so the encode loop can start
+		// immediately. In a debug build this build is ~37s; running it inline
+		// here is the /launch black-screen race. The lazy get_fec_encoder path
+		// covers the first frames until the consumer merges the map below.
+		let warm_up_handle = Packetizer::warm_up_async(self.config.fec_percentage, ctx.minimum_fec_packets);
 
 		// The encoder is asynchronous: each `encode()` returns a future that
 		// resolves with that frame's packet once the GPU finishes. We hand each
@@ -635,6 +657,7 @@ impl VideoPipelineInner {
 				stats_tx,
 				in_flight,
 				packetizer,
+				warm_up_handle,
 				ctx,
 				config,
 			))
