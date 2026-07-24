@@ -199,6 +199,14 @@ fn run_capture(
 	// device stops producing data (e.g. game exited, virtual_oss idle).
 	let poll_timeout_ms: libc::c_int = 100;
 
+	// Frame-drop streak tracking: virtual_oss produces samples continuously
+	// even when no client is playing, and the AudioEncoder is start_notify-
+	// gated on RTSP PLAY. Between capture start and PLAY (and briefly again
+	// on PLAY tear-down) we'll drop every frame we produce. Log a single
+	// debug! at the start of each streak and a summary when it ends, rather
+	// than a trace! per frame (~200 per second of noise otherwise).
+	let mut drop_streak: u32 = 0;
+
 	while !stop.is_shutdown_triggered() {
 		// Wait for the fd to become readable, or timeout.
 		let mut pfd = libc::pollfd {
@@ -282,9 +290,19 @@ fn run_capture(
 		// frame. The recycle pool guarantees the encoder always has a
 		// pre-allocated buffer to send back, so we don't deadlock.
 		match frame_tx.try_send(frame) {
-			Ok(()) => {},
+			Ok(()) => {
+				if drop_streak > 0 {
+					tracing::debug!("Encoder caught up after dropping {drop_streak} audio frame(s).");
+					drop_streak = 0;
+				}
+			},
 			Err(crossbeam_channel::TrySendError::Full(_dropped)) => {
-				tracing::trace!("Encoder behind; dropping audio frame");
+				if drop_streak == 0 {
+					tracing::debug!(
+						"AudioEncoder not draining; dropping audio frames (typical pre-RTSP-PLAY silence)."
+					);
+				}
+				drop_streak = drop_streak.saturating_add(1);
 			},
 			Err(crossbeam_channel::TrySendError::Disconnected(_)) => return Ok(()),
 		}
