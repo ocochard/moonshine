@@ -101,6 +101,28 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		"PROTON_USE_PIPEWIRE=0".to_string(),
 	];
 
+	// Audio backend selection depends on the host:
+	// - Linux: apps go through PulseAudio (or Pipewire in Pulse-compat
+	//   mode). moonshine hosts its own PulseAudio server on
+	//   $XDG_RUNTIME_DIR/moonshine/pulse/native.
+	// - FreeBSD: default sdl3 port ships with PULSEAUDIO=off, so
+	//   PULSE_SERVER is useless. Instead we route the game to
+	//   /dev/dsp.loop, virtual_oss's loopback device (base system
+	//   from FreeBSD 13+, already running as the boot-time
+	//   virtual_oss service on typical hosts). moonshine's own
+	//   audio capture reads PCM back from the same device.
+	#[cfg(target_os = "linux")]
+	{
+		envs.push("SDL_AUDIODRIVER=pulseaudio".to_string());
+		envs.push("AUDIODRIVER=pulse".to_string());
+	}
+	#[cfg(target_os = "freebsd")]
+	{
+		envs.push("SDL_AUDIODRIVER=dsp".to_string());
+		envs.push("SDL_AUDIODEV=/dev/dsp.loop".to_string());
+		envs.push("AUDIODEV=/dev/dsp.loop".to_string());
+	}
+
 	if context.hdr {
 		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
 		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
