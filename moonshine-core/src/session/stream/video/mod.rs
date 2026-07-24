@@ -232,6 +232,13 @@ impl VideoStream {
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
+		// Match Sunshine: 1 MiB SO_SNDBUF so IDR-frame FEC bursts don't
+		// hit ENOBUFS through userspace tunnels (WireGuard/Tailscale) whose
+		// small TUN queue can't absorb ~20 shards in <10ms otherwise.
+		if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(1 << 20) {
+			tracing::warn!("Failed to set video socket send buffer size to 1 MiB: {e}");
+		}
+
 		tracing::debug!(
 			"Listening for video messages on {}",
 			socket
