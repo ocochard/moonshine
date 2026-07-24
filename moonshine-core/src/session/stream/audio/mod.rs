@@ -1,4 +1,3 @@
-use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,11 +12,25 @@ use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionKeysReceiver;
 
 use self::encoder::AudioEncoder;
-use self::pulse_server::{PulseServer, CAPTURE_SAMPLE_RATE};
+use self::frame::CAPTURE_SAMPLE_RATE;
+
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixListener;
+#[cfg(target_os = "linux")]
+use self::pulse_server::PulseServer;
+
+#[cfg(target_os = "freebsd")]
+use self::oss_capture::OssCapture;
 
 mod buffer;
 mod encoder;
+mod frame;
+
+#[cfg(target_os = "linux")]
 mod pulse_server;
+
+#[cfg(target_os = "freebsd")]
+mod oss_capture;
 
 /// Configuration for the audio stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,8 +207,25 @@ impl AudioStartHandle {
 	}
 }
 
+/// Path to `/dev/dsp.loop` — the `virtual_oss(8)` loopback device that games
+/// write PCM to via `SDL_AUDIODEV`, and that moonshine reads back on FreeBSD.
+#[cfg(target_os = "freebsd")]
+const OSS_LOOP_DEVICE: &str = "/dev/dsp.loop";
+
+#[cfg(target_os = "linux")]
 pub(crate) struct AudioStream {
 	pulse_socket: UnixListener,
+	pub pulse_socket_path: PathBuf,
+	udp_socket: tokio::net::UdpSocket,
+	stop: ShutdownManager<SessionShutdownReason>,
+}
+
+#[cfg(target_os = "freebsd")]
+pub(crate) struct AudioStream {
+	/// Kept on the struct so `ApplicationContext` still has a `PathBuf` to
+	/// stuff into `PULSE_SERVER=unix:...`. It points at nothing — the FreeBSD
+	/// SDL3 port has `PULSEAUDIO=off`, so games ignore this env and use
+	/// `SDL_AUDIODEV=/dev/dsp.loop` instead.
 	pub pulse_socket_path: PathBuf,
 	udp_socket: tokio::net::UdpSocket,
 	stop: ShutdownManager<SessionShutdownReason>,
@@ -213,30 +243,45 @@ impl AudioStream {
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
-		// Create the socket directory for the PulseAudio server.
-		let pulse_socket_dir = dirs::runtime_dir()
-			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
-			.join("moonshine/pulse");
-		std::fs::create_dir_all(&pulse_socket_dir)
-			.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
-		let pulse_socket_path = pulse_socket_dir.join("native");
+		#[cfg(target_os = "linux")]
+		{
+			// Create the socket directory for the PulseAudio server.
+			let pulse_socket_dir = dirs::runtime_dir()
+				.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
+				.join("moonshine/pulse");
+			std::fs::create_dir_all(&pulse_socket_dir)
+				.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
+			let pulse_socket_path = pulse_socket_dir.join("native");
 
-		// Remove any stale socket file from a previous session.
-		let _ = std::fs::remove_file(&pulse_socket_path);
+			// Remove any stale socket file from a previous session.
+			let _ = std::fs::remove_file(&pulse_socket_path);
 
-		// Bind the PulseAudio socket before launching the application so that
-		// the app can connect as soon as it starts.
-		let pulse_socket = UnixListener::bind(&pulse_socket_path)
-			.map_err(|e| tracing::error!("Failed to bind PulseAudio socket: {e}"))?;
+			// Bind the PulseAudio socket before launching the application so that
+			// the app can connect as soon as it starts.
+			let pulse_socket = UnixListener::bind(&pulse_socket_path)
+				.map_err(|e| tracing::error!("Failed to bind PulseAudio socket: {e}"))?;
 
-		tracing::debug!("Listening for audio messages on {}", pulse_socket_path.display());
+			tracing::debug!("Listening for audio messages on {}", pulse_socket_path.display());
 
-		Ok(AudioStream {
-			pulse_socket,
-			pulse_socket_path,
-			udp_socket,
-			stop,
-		})
+			Ok(AudioStream {
+				pulse_socket,
+				pulse_socket_path,
+				udp_socket,
+				stop,
+			})
+		}
+
+		#[cfg(target_os = "freebsd")]
+		{
+			tracing::debug!("Audio will be captured from {}.", OSS_LOOP_DEVICE);
+			Ok(AudioStream {
+				// Give the app a plausible-looking path so PULSE_SERVER env
+				// stays well-formed. Nothing binds this socket.
+				pulse_socket_path: PathBuf::from("/dev/null"),
+				udp_socket,
+				stop,
+			})
+		}
 	}
 
 	pub fn start(self, context: AudioStreamContext, keys_rx: SessionKeysReceiver) -> Result<AudioStartHandle, ()> {
@@ -252,11 +297,14 @@ impl AudioStream {
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
 		spawn_handle_audio_packets(packet_rx, self.udp_socket, start_notify.clone(), self.stop.clone());
 
-		// Create frame channels for PulseServer and encoder communication.
+		// Create frame channels for the capture backend and encoder communication.
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
 		let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(3);
 
-		// Spawn PulseServer immediately (no gating — it just mixes audio, no network impact).
+		// Spawn the platform-specific audio-capture backend immediately (no
+		// gating — capture-side buffering is small and produces no network
+		// traffic).
+		#[cfg(target_os = "linux")]
 		PulseServer::spawn(
 			self.pulse_socket,
 			self.pulse_socket_path.clone(),
@@ -267,6 +315,16 @@ impl AudioStream {
 			self.stop.clone(),
 		)
 		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
+
+		#[cfg(target_os = "freebsd")]
+		OssCapture::spawn(
+			context.audio_config.channels as u8,
+			context.packet_duration_ms,
+			frame_tx,
+			frame_recycle_rx,
+			self.stop.clone(),
+		)
+		.map_err(|e| tracing::error!("Failed to create OssCapture: {e}"))?;
 
 		// Spawn audio encoder — gated behind start_notify.
 		AudioEncoder::spawn(
