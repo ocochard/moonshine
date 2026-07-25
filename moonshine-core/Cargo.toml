@@ -7,7 +7,7 @@ edition = "2024"
 aes = "0.9.1"
 aes-gcm = "0.10.3"
 async-shutdown = "0.2.2"
-ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649" }
+ash = { path = "../vendor/ash/ash" }
 aws-lc-rs = "1.17.0"
 bitflags = "2.13.0"
 byteorder = "1.5.0"
@@ -34,7 +34,8 @@ notify-rust = "4.17.0"
 open = "5.3.5"
 opus = "0.3.1"
 pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.9.1", features = ["dmabuf"] }
+# Vendored at upstream tag v0.9.1 (see vendor/README.md).
+pixelforge = { path = "../vendor/pixelforge", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
@@ -48,7 +49,8 @@ serde_json = "1.0.149"
 sha2 = "0.11.0"
 shellexpand = "3.1.2"
 shlex = "2.0.1"
-smithay = { git = "https://github.com/Smithay/smithay", rev = "0ff00983b6007257a7a161a4fe8b14a778e2ac8f", default-features = false, features = [
+# Vendored at upstream rev 0ff00983b6007257a7a161a4fe8b14a778e2ac8f (see vendor/README.md).
+smithay = { path = "../vendor/smithay/smithay", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
     "backend_egl",
@@ -87,7 +89,7 @@ zvariant = "5.12.0"
 # On other targets, `Gamepad` is a no-op stub (see gamepad_stub.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
 mio-timerfd = "0.2.0"
-inputtino = { version = "0.1.0", git = "https://github.com/games-on-whales/inputtino" }
+inputtino = { version = "0.1.0", path = "../vendor/inputtino/bindings/rust/inputtino" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
