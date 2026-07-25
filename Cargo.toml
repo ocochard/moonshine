@@ -1,5 +1,14 @@
 [workspace]
 members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
+# Vendored git deps live under vendor/. Those that carry their own
+# [workspace] root (ash, smithay, inputtino) are excluded so Cargo reaches
+# them as independent workspaces via path dependency instead of trying to
+# absorb them as members of ours.
+exclude = [
+    "vendor/ash",
+    "vendor/smithay",
+    "vendor/inputtino",
+]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,17 @@
+[package]
+name = "inputtino"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/games-on-whales/inputtino"
+authors = ["ABeltramo"]
+description = "Safe wrapper around Rust bindings for inputtino"
+
+# Vendored into moonshine: [dev-dependencies] (input, rustix, approx, sdl2,
+# serial_test) removed — used only by inputtino's own tests, which pulled
+# sdl2/input/udev into moonshine's Cargo.lock once inputtino became a path
+# dependency. inputtino is linux-gated in moonshine-core and never built on
+# FreeBSD anyway.
+
+[dependencies]
+inputtino-sys = { version = "0.1.0", path = "../inputtino-sys" }
