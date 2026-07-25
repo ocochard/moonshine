@@ -6,9 +6,17 @@ mod backend_inputtino;
 #[cfg(target_os = "linux")]
 pub(crate) use backend_inputtino::Gamepad;
 
-#[cfg(not(target_os = "linux"))]
+// FreeBSD has a Linux-ABI-compatible evdev/uinput subsystem, so we inject a
+// virtual controller through /dev/uinput directly (inputtino can't build here:
+// it pulls in Linux-only UAPI headers). See backend_freebsd.rs.
+#[cfg(target_os = "freebsd")]
+mod backend_freebsd;
+#[cfg(target_os = "freebsd")]
+pub(crate) use backend_freebsd::Gamepad;
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 mod backend_stub;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub(crate) use backend_stub::Gamepad;
 
 /// Motion sensor kind reported by the client. Values match the wire protocol
