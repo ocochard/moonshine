@@ -8,7 +8,7 @@ description = "Moonshine Vulkan swapchain layer — intercepts Vulkan presentati
 crate-type = ["cdylib"]
 
 [dependencies]
-ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649", default-features = false }
+ash = { path = "../vendor/ash/ash", default-features = false }
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-scanner = "0.31"
