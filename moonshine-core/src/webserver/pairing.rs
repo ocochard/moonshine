@@ -29,6 +29,13 @@ macro_rules! require_param {
 	};
 }
 
+/// Whether a D-Bus session bus is reachable, i.e. a desktop notification could
+/// plausibly be delivered. On a headless host this is false, so we skip the
+/// desktop notification (and its inevitable failure warning) entirely.
+fn session_bus_available() -> bool {
+	std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+}
+
 /// Build a `<root status_code="200"><paired>1</paired>…</root>` XML response.
 fn paired_xml_response(inner: impl std::fmt::Display) -> Response<Full<Bytes>> {
 	let body = format!("<root status_code=\"200\"><paired>1</paired>{inner}</root>");
@@ -170,12 +177,34 @@ async fn get_server_cert(
 		notify
 	};
 
-	// Emit a notification, allowing the user to automatically open the PIN page.
-	if let Some(local_address) = local_address {
-		let pin_address = SocketAddr::new(local_address.ip(), http_port);
-		let pin_url = format!("http://{pin_address}/pin?uniqueid={unique_id}");
-		tracing::info!("Waiting for pin to be sent at {pin_url}");
+	// Surface the PIN page to the operator. The URL is always logged as a loud,
+	// greppable banner (this is the only surfacing that works on a headless
+	// server); the desktop notification is a best-effort convenience on top and
+	// is only attempted when a D-Bus session bus is actually present, so headless
+	// hosts don't log a spurious "Failed to show PIN notification" warning.
+	let pin_url = match local_address {
+		Some(local_address) => {
+			let pin_address = SocketAddr::new(local_address.ip(), http_port);
+			format!("http://{pin_address}/pin?uniqueid={unique_id}")
+		},
+		// Local address unknown: still surface the path so the operator can
+		// substitute the host:port they reach the web server on.
+		None => format!("http://<this-host>:{http_port}/pin?uniqueid={unique_id}"),
+	};
+	tracing::info!(
+		"\n\
+		========================================================================\n\
+		  PAIRING REQUESTED — open this URL in a browser to enter the PIN:\n\
+		\n\
+		    {pin_url}\n\
+		========================================================================"
+	);
 
+	// A desktop notification only makes sense with a running notification daemon,
+	// which requires a D-Bus session bus. Absent one (any headless host), skip it
+	// silently rather than failing and warning.
+	if session_bus_available() {
+		let notify_url = pin_url.clone();
 		let _ = std::thread::Builder::new()
 			.name("pin-notification".to_string())
 			.spawn(move || {
@@ -189,10 +218,10 @@ async fn get_server_cert(
 					.map_err(|e| tracing::warn!("Failed to show PIN notification: {e}"))?
 					.wait_for_action(|action| {
 						if action != "__closed"
-							&& let Err(e) = open::that(&pin_url)
+							&& let Err(e) = open::that(&notify_url)
 						{
 							tracing::warn!(
-								"Couldn't open the PIN page automatically ({e}). Open it manually: {pin_url}"
+								"Couldn't open the PIN page automatically ({e}). Open it manually: {notify_url}"
 							);
 						}
 					});
