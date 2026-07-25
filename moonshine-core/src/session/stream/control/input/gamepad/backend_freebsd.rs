@@ -13,8 +13,14 @@
 //! input_absinfo=24, uinput_setup=92, uinput_abs_setup=28).
 //!
 //! Scope: core pad only (buttons + dpad + 2 sticks + 2 analog triggers), always
-//! Xbox layout. Rumble/motion/touchpad/battery are deferred no-ops. See
-//! `~/myscripts/FreeBSD/moonshine/GAMEPAD-FREEBSD.md` for the full study.
+//! Xbox layout. Motion/touchpad/battery are deferred no-ops. Rumble is a no-op
+//! too, but for a hard reason: FreeBSD's evdev/uinput has no force-feedback
+//! path — `EVIOCSFF` and the `UI_*_FF_*` handshake are kernel stubs that return
+//! 0 without doing anything, and `EV_UINPUT` upload requests are never emitted,
+//! so there is nothing for a userspace FF implementation to service. See
+//! `~/myscripts/FreeBSD/moonshine/GAMEPAD-FREEBSD.md` for the full study and
+//! `~/myscripts/FreeBSD/moonshine/RUMBLE-FREEBSD.md` for what a kernel FF
+//! implementation would require (future task).
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
