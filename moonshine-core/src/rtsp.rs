@@ -85,10 +85,16 @@ impl RtspServer {
 							tracing::debug!("RTSP server listening on {}", socket_addr);
 
 							loop {
-								let (connection, address) = listener
-									.accept()
-									.await
-									.map_err(|e| tracing::error!("Failed to accept connection: {}", e))?;
+								// A per-connection accept() error (e.g. ECONNABORTED) is non-fatal:
+								// log and continue rather than propagating it, which would trigger a
+								// global shutdown of every listener via the shared ShutdownManager.
+								let (connection, address) = match listener.accept().await {
+									Ok(pair) => pair,
+									Err(e) => {
+										tracing::warn!("Failed to accept connection: {}", e);
+										continue;
+									}
+								};
 								tracing::trace!("Accepted connection from {}", address);
 
 								tokio::spawn({
