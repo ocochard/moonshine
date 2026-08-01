@@ -159,10 +159,17 @@ impl Webserver {
 
 							tracing::debug!("HTTP server listening for connections on {http_address}");
 							loop {
-								let (connection, address) = listener
-									.accept()
-									.await
-									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
+								// A per-connection accept() error (e.g. ECONNABORTED from a peer that
+								// reset before accept() completed) is non-fatal: log and continue rather
+								// than propagating it, which would trigger a global shutdown of every
+								// listener via the shared ShutdownManager.
+								let (connection, address) = match listener.accept().await {
+									Ok(pair) => pair,
+									Err(e) => {
+										tracing::warn!("Failed to accept connection: {e}");
+										continue;
+									}
+								};
 								tracing::trace!("Accepted connection from {address}.");
 
 								let address = connection.local_addr().ok().map(unmap_v4_mapped);
@@ -245,10 +252,15 @@ impl Webserver {
 
 							tracing::debug!("HTTPS server listening for connections on {https_address}");
 							loop {
-								let (connection, address) = listener
-									.accept()
-									.await
-									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
+								// See the HTTP accept loop above: per-connection accept() errors are
+								// non-fatal and must not tear down the shared ShutdownManager.
+								let (connection, address) = match listener.accept().await {
+									Ok(pair) => pair,
+									Err(e) => {
+										tracing::warn!("Failed to accept connection: {e}");
+										continue;
+									}
+								};
 								tracing::trace!("Accepted TLS connection from {address}.");
 
 								let address = connection.local_addr().ok().map(unmap_v4_mapped);
