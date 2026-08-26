@@ -93,6 +93,7 @@ struct CachedImport {
 ///
 /// The startup healthcheck guarantees `kcmp(2)` is available, so this never
 /// returns an error at runtime.
+#[cfg(target_os = "linux")]
 pub(crate) fn same_open_file(a: RawFd, b: RawFd) -> bool {
 	/// `KCMP_FILE` — not exposed by `libc` or glibc.
 	const KCMP_FILE: libc::c_int = 0;
@@ -116,6 +117,21 @@ pub(crate) fn same_open_file(a: RawFd, b: RawFd) -> bool {
 
 	// 0 = identical, 1/2 = ordering between distinct files.
 	result == 0
+}
+
+/// FreeBSD has no `kcmp(2)` equivalent: `fstat(2)` and `kinfo_getfile(3)` both
+/// report identical `st_dev`/`st_ino`/offset for two independent `open(2)`s of
+/// the same file, so neither can tell "same open file description" from "same
+/// inode, different description".
+///
+/// Answering `false` is the only safe direction. A false negative just re-imports
+/// the buffer (a cache miss); a false positive would reuse a Vulkan image for a
+/// *different* buffer that happened to land on a recycled fd number, streaming a
+/// stale frame. The import cache is therefore effectively disabled here — every
+/// `import_or_reuse` re-imports.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn same_open_file(_a: RawFd, _b: RawFd) -> bool {
+	false
 }
 
 impl CachedImport {
@@ -420,6 +436,9 @@ mod tests {
 		assert_ne!(a, b);
 	}
 
+	// `same_open_file` only reports true identity on Linux (kcmp(2)); elsewhere it
+	// conservatively answers false. See its non-Linux definition.
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn kcmp_distinguishes_open_file_descriptions() {
 		let a = std::fs::File::open("/dev/null").unwrap();

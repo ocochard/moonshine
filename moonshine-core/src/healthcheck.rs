@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::io::IsTerminal;
 use std::io::Write;
-use std::os::linux::fs::MetadataExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -304,7 +304,7 @@ fn group_name_of(path: &Path) -> String {
 	let Ok(meta) = std::fs::metadata(path) else {
 		return "unknown".into();
 	};
-	let gid = meta.st_gid();
+	let gid = meta.gid();
 	let grp = unsafe { libc::getgrgid(gid) };
 	if grp.is_null() {
 		format!("gid {gid}")
@@ -849,6 +849,21 @@ fn check_inhibit(report: &mut HealthReport) {
 	);
 }
 
+/// FreeBSD has no `kcmp(2)`, so the DMA-BUF import cache cannot verify that a
+/// recycled fd still refers to the same buffer and conservatively re-imports
+/// every frame (see `dmabuf::same_open_file`). That costs a little GPU work but
+/// is correct, so this reports informationally rather than failing.
+#[cfg(not(target_os = "linux"))]
+fn check_kcmp(report: &mut HealthReport) {
+	let start = Instant::now();
+	report.add_passed(
+		"kcmp(2)",
+		"Not available on this platform; DMA-BUF import cache disabled (correct, slightly slower)".into(),
+		start.elapsed().as_millis() as u64,
+	);
+}
+
+#[cfg(target_os = "linux")]
 fn check_kcmp(report: &mut HealthReport) {
 	let start = Instant::now();
 

@@ -1,3 +1,5 @@
+use std::os::fd::{AsFd, BorrowedFd};
+
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::net::UdpSocket;
 
@@ -29,6 +31,14 @@ fn gso_segments_per_send(max_gso_segments: usize, shard_size: usize) -> usize {
 pub(crate) struct UdpGsoSocket {
 	socket: UdpSocket,
 	udp_state: UdpSocketState,
+}
+
+/// Exposes the underlying socket so callers can apply socket options
+/// (e.g. `SO_SNDBUF`) via `socket2::SockRef`.
+impl AsFd for UdpGsoSocket {
+	fn as_fd(&self) -> BorrowedFd<'_> {
+		self.socket.as_fd()
+	}
 }
 
 impl UdpGsoSocket {
