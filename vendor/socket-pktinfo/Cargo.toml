@@ -1,9 +1,11 @@
 [package]
 name = "socket-pktinfo"
-# Pinned to a 0.3.x version so it satisfies mdns-sd's "^0.3.2" requirement
-# via [patch.crates-io]. The source is a fork of upstream 0.4.0 plus the
-# FreeBSD/BSD IPv4 PKTINFO backport (IP_RECVDSTADDR + IP_RECVIF).
-version = "0.3.99"
+# Fork of upstream 0.4.x plus the FreeBSD/BSD IPv4 PKTINFO backport
+# (IP_RECVDSTADDR + IP_RECVIF). The version must stay within the range
+# mdns-sd requires, or [patch.crates-io] silently goes unused and the
+# unpatched (Linux-only) crate is built instead — breaking mDNS on FreeBSD.
+# mdns-sd 0.20.3 requires ^0.4.0.
+version = "0.4.1"
 authors = ["pixsperdavid <david@pixsper.com>"]
 edition = "2018"
 rust-version = "1.71.0"

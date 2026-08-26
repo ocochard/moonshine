@@ -70,6 +70,7 @@ struct VideoContextInner {
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     video_encode_queue_family: Option<u32>,
+    video_encode_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
     transfer_queue_family: u32,
     transfer_queue: vk::Queue,
@@ -116,6 +117,14 @@ impl VideoContext {
 
     pub(crate) fn video_encode_queue(&self) -> Option<vk::Queue> {
         self.inner.video_encode_queue
+    }
+
+    /// Whether the selected video encode queue family supports timestamp
+    /// queries, i.e. reports a non-zero `timestampValidBits`. RADV's dedicated
+    /// video encode queue reports 0, so `vkCmdWriteTimestamp` is illegal there
+    /// (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
+    pub(crate) fn encode_timestamps_supported(&self) -> bool {
+        self.inner.video_encode_timestamp_valid_bits > 0
     }
 
     /// Get the transfer queue family index.
@@ -240,11 +249,21 @@ impl VideoContext {
             .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
 
         let mut selected_device = None;
+        let mut selected_device_exts = None;
         let mut video_encode_queue_family = None;
+        let mut video_encode_timestamp_valid_bits = 0u32;
         let mut transfer_queue_family = u32::MAX;
         let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
         let mut has_descriptor_buffer_ext = false;
+
+        let has_extension =
+            |extensions: &[vk::ExtensionProperties], name: &std::ffi::CStr| -> bool {
+                extensions.iter().any(|ext| {
+                    let ext_name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+                    ext_name == name
+                })
+            };
 
         for physical_device in physical_devices {
             let props = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -258,6 +277,7 @@ impl VideoContext {
 
             // Find queue families.
             let mut encode_queue = None;
+            let mut encode_ts_bits = 0u32;
             let mut transfer_q = u32::MAX;
             let mut compute_q = u32::MAX;
 
@@ -270,6 +290,7 @@ impl VideoContext {
                 // Check for video encode queue.
                 if props.queue_flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
                     encode_queue = Some(idx as u32);
+                    encode_ts_bits = props.timestamp_valid_bits;
                     debug!("Found video encode queue at family {}", idx);
                 }
 
@@ -285,48 +306,41 @@ impl VideoContext {
                 }
             }
 
+            // Get list of available device extensions
+            let available_extensions = match unsafe {
+                instance.enumerate_device_extension_properties(physical_device)
+            } {
+                Ok(exts) => exts,
+                Err(e) => {
+                    warn!(
+                        "Failed to enumerate device extension properties for {}: {}. Skipping device.",
+                        device_name, e
+                    );
+                    continue;
+                }
+            };
+
             // Check codec support for encoding.
             let mut encode_codecs = Vec::new();
             if let Some(eq) = encode_queue {
-                // Get list of available device extensions
-                let available_extensions = match unsafe {
-                    instance.enumerate_device_extension_properties(physical_device)
-                } {
-                    Ok(exts) => exts,
-                    Err(e) => {
-                        warn!(
-                            "Failed to enumerate device extension properties for {}: {}. Skipping device.",
-                            device_name, e
-                        );
-                        continue;
-                    }
-                };
-
-                let has_extension = |name: &std::ffi::CStr| -> bool {
-                    available_extensions.iter().any(|ext| {
-                        let ext_name =
-                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-                        ext_name == name
-                    })
-                };
-
                 // Check if descriptor buffer extension is available.
-                has_descriptor_buffer_ext = has_extension(ash::ext::descriptor_buffer::NAME);
+                has_descriptor_buffer_ext =
+                    has_extension(&available_extensions, ash::ext::descriptor_buffer::NAME);
 
                 // Only check codec support if the extension exists
-                if has_extension(ash::khr::video_encode_h264::NAME)
+                if has_extension(&available_extensions, ash::khr::video_encode_h264::NAME)
                     && Self::check_h264_encode_support(&entry, &instance, physical_device, eq)
                 {
                     encode_codecs.push(Codec::H264);
                     debug!("Device {} supports H.264 encode", device_name);
                 }
-                if has_extension(ash::khr::video_encode_h265::NAME)
+                if has_extension(&available_extensions, ash::khr::video_encode_h265::NAME)
                     && Self::check_h265_encode_support(&entry, &instance, physical_device, eq)
                 {
                     encode_codecs.push(Codec::H265);
                     debug!("Device {} supports H.265 encode", device_name);
                 }
-                if has_extension(ash::khr::video_encode_av1::NAME)
+                if has_extension(&available_extensions, ash::khr::video_encode_av1::NAME)
                     && Self::check_av1_encode_support(&entry, &instance, physical_device, eq)
                 {
                     encode_codecs.push(Codec::AV1);
@@ -346,7 +360,9 @@ impl VideoContext {
 
             if has_video_support && encode_supported && has_compute_support {
                 selected_device = Some(physical_device);
+                selected_device_exts = Some(available_extensions);
                 video_encode_queue_family = encode_queue;
+                video_encode_timestamp_valid_bits = encode_ts_bits;
                 transfer_queue_family = if transfer_q != u32::MAX {
                     transfer_q
                 } else {
@@ -454,17 +470,40 @@ impl VideoContext {
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
 
+        let mut supported_timeline_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut timeline_feature_query =
+            vk::PhysicalDeviceFeatures2::default().push(&mut supported_timeline_features);
+        unsafe {
+            instance.get_physical_device_features2(physical_device, &mut timeline_feature_query);
+        }
+        if supported_timeline_features.timeline_semaphore == 0 {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "Timeline semaphores are required for pipelined video encode synchronization"
+                    .to_string(),
+            ));
+        }
+        let mut timeline_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+
         // Enable sampler YCbCr conversion feature (required for YUV image views with SAMPLED flag).
         let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
             .sampler_ycbcr_conversion(true);
 
-        // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
+        let has_ycbcr_2plane_444_ext = if let Some(device_exts) = selected_device_exts {
+            has_extension(&device_exts, ash::ext::ycbcr_2plane_444_formats::NAME)
+        } else {
+            false
+        };
+
         let mut ycbcr_2plane_444_features =
             vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default()
                 .ycbcr2plane444_formats(true);
 
-        // Add the 2-plane 444 formats extension.
-        push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
+        if has_ycbcr_2plane_444_ext {
+            // Add the 2-plane 444 formats extension.
+            push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
+        }
 
         // Enable AV1 video encode feature only if AV1 is supported.
         // Only include AV1 features in the pNext chain when AV1 is actually supported,
@@ -496,7 +535,9 @@ impl VideoContext {
                 desc_buf_features.descriptor_buffer = 1;
                 desc_buf_features.descriptor_buffer_capture_replay = 1;
             } else if desc_buf_supported {
-                warn!("VK_EXT_descriptor_buffer extension present but bufferDeviceAddress not supported; descriptor buffer will not be enabled");
+                warn!(
+                    "VK_EXT_descriptor_buffer extension present but bufferDeviceAddress not supported; descriptor buffer will not be enabled"
+                );
             }
         }
 
@@ -515,7 +556,8 @@ impl VideoContext {
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&extension_names)
-            .push(&mut sync2_features);
+            .push(&mut sync2_features)
+            .push(&mut timeline_features);
 
         if supported_encode_codecs.contains(&Codec::AV1) {
             device_create_info = device_create_info.push(&mut av1_encode_features);
@@ -529,8 +571,12 @@ impl VideoContext {
             device_create_info = device_create_info
                 .push(&mut desc_buf_features)
                 .push(&mut buffer_device_address_features)
-                .push(&mut ycbcr_features)
-                .push(&mut ycbcr_2plane_444_features);
+                .push(&mut ycbcr_features);
+
+            // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
+            if has_ycbcr_2plane_444_ext {
+                device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
+            }
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
@@ -556,6 +602,7 @@ impl VideoContext {
                 physical_device,
                 device,
                 video_encode_queue_family,
+                video_encode_timestamp_valid_bits,
                 video_encode_queue,
                 transfer_queue_family,
                 transfer_queue,

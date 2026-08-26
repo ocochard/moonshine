@@ -140,11 +140,7 @@ impl OutputFormat {
 
     /// Bytes per sample for this format.
     pub fn bytes_per_sample(&self) -> usize {
-        if self.is_10bit() {
-            2
-        } else {
-            1
-        }
+        if self.is_10bit() { 2 } else { 1 }
     }
 }
 
@@ -175,7 +171,7 @@ pub struct ColorConverterConfig {
 }
 
 impl ColorConverterConfig {
-    /// Create a new configuration with BT.709 color space and full range.
+    /// Create a new configuration with BT.709 color space and limited range.
     pub fn new(
         width: u32,
         height: u32,
@@ -188,7 +184,7 @@ impl ColorConverterConfig {
             input_format,
             output_format,
             color_space: ColorSpace::Bt709,
-            full_range: true,
+            full_range: false,
             sdr_reference_white_nits: 203.0,
         }
     }
@@ -588,11 +584,24 @@ impl ColorConverter {
 
             // --- Phase 1: Transition source image for shader read ---
 
+            // For external memory (DMA-BUF) imports with EXCLUSIVE sharing,
+            // the first use must include a queue family acquire operation.
+            // Set srcQueueFamilyIndex to EXTERNAL (ownership is foreign)
+            // and dstQueueFamilyIndex to the encoder's compute queue family.
+            let needs_acquire = src_layout == vk::ImageLayout::UNDEFINED;
             let src_barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(src_layout)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .src_queue_family_index(if needs_acquire {
+                    vk::QUEUE_FAMILY_EXTERNAL
+                } else {
+                    vk::QUEUE_FAMILY_IGNORED
+                })
+                .dst_queue_family_index(if needs_acquire {
+                    self.context.compute_queue_family()
+                } else {
+                    vk::QUEUE_FAMILY_IGNORED
+                })
                 .image(src_image)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -601,7 +610,11 @@ impl ColorConverter {
                     base_array_layer: 0,
                     layer_count: 1,
                 })
-                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .src_access_mask(if needs_acquire {
+                    vk::AccessFlags::empty()
+                } else {
+                    vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+                })
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
 
             device.cmd_pipeline_barrier(
@@ -774,10 +787,13 @@ impl ColorConverter {
             );
 
             // Transition target image (encoder's input) to TRANSFER_DST layout.
+            // The encoder's init clears the input image and leaves it in
+            // VIDEO_ENCODE_SRC_KHR, so we must use that (not UNDEFINED) as the
+            // old layout on every frame, including the first.
             let target_barrier_to_transfer = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
+                .old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .image(target_image)
                 .subresource_range(vk::ImageSubresourceRange {
@@ -790,7 +806,7 @@ impl ColorConverter {
 
             device.cmd_pipeline_barrier(
                 self.command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
