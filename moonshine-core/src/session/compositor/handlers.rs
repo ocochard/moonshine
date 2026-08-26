@@ -547,6 +547,27 @@ impl MoonshineCompositor {
 	///
 	/// Gamescope: `handle_net_wm_state()`
 	fn set_x11_fullscreen(&mut self, window: &X11Surface, fullscreen: bool) {
+		// Ignore a request that does not change anything. Clients launched
+		// already-fullscreen (e.g. with `-fullscreen`) re-assert the state while
+		// XWayland is still mapping them, and the `reevaluate_focus()` below then
+		// re-runs focus mid-transition. On FreeBSD/XWayland that left the pointer
+		// clamped to a region in the middle of the output: motion arrived (relative
+		// deltas were correct) but the cursor could not leave the box. Skipping the
+		// no-op keeps upstream's fullscreen support for clients that genuinely
+		// transition, which is what needs the state and the geometry.
+		if let Some(elem) = self.find_window_by_x11_surface(window)
+			&& let Some(meta) = self.window_metadata.get(&elem)
+			&& meta.fullscreen == fullscreen
+		{
+			tracing::debug!(
+				target: "focus",
+				window_id = window.window_id(),
+				fullscreen,
+				"X11 fullscreen state already applied; skipping focus re-evaluation"
+			);
+			return;
+		}
+
 		if let Err(e) = window.set_fullscreen(fullscreen) {
 			tracing::warn!("Failed to set X11 fullscreen state: {e}");
 			return;
