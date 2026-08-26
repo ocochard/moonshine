@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -76,6 +77,8 @@ pub(crate) struct ApplicationContext {
 	pub wayland_display: String,
 	/// Effective HDR mode — `true` only when the compositor confirmed an HDR-capable DMA-BUF format is in use.
 	pub hdr: bool,
+	/// Environment variables to pass on.
+	pub extra_env: HashMap<String, String>,
 }
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
@@ -132,6 +135,10 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		// surface formats correctly (the factory global is always present for
 		// SDR sessions too, so we need an explicit capability signal).
 		envs.push("MOONSHINE_HDR=1".to_string());
+	}
+
+	for (key, value) in &context.extra_env {
+		envs.push(format!("{key}={value}"));
 	}
 
 	Ok(envs)
