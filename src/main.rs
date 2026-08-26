@@ -73,9 +73,20 @@ async fn main() -> Result<(), ()> {
 	config.applications.extend(scanned_applications);
 	app_scanner::resolve_missing_boxart(&mut config.applications);
 
-	tracing::debug!("Waiting for D-Bus session bus...");
-	wait_for_dbus().await?;
-	tracing::debug!("D-Bus session bus available.");
+	// Only block on a session bus if one is actually advertised. A headless
+	// host (the normal case on FreeBSD, where nothing starts a per-user bus)
+	// has no DBUS_SESSION_BUS_ADDRESS, so waiting for one never succeeds and
+	// the server never gets as far as binding its ports. The features that
+	// need D-Bus — the systemd launch backend and sleep inhibit — are either
+	// Linux-only or degrade to a warning, so skipping the wait costs nothing
+	// here.
+	if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+		tracing::debug!("Waiting for D-Bus session bus...");
+		wait_for_dbus().await?;
+		tracing::debug!("D-Bus session bus available.");
+	} else {
+		tracing::info!("No DBUS_SESSION_BUS_ADDRESS set; continuing without a D-Bus session bus.");
+	}
 
 	// Run health checks unless the user explicitly disabled them.
 	// If health checks are disabled, we still probe the GPU for supported codecs and HDR support.
