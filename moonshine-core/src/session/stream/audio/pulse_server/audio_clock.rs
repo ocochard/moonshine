@@ -28,8 +28,16 @@ mod imp {
 		}
 
 		pub fn drain(&mut self) -> io::Result<()> {
-			self.inner.read()?;
-			Ok(())
+			// A wakeup can race its own drain and find no expirations left to
+			// read (EAGAIN). That is not fatal: skip the tick rather than
+			// propagating an error that would tear down the whole session.
+			// Matches the non-Linux implementation below, which also treats an
+			// empty drain as success.
+			match self.inner.read() {
+				Ok(_) => Ok(()),
+				Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+				Err(e) => Err(e),
+			}
 		}
 	}
 
