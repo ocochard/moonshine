@@ -419,6 +419,20 @@ impl X11Focus {
 			tracing::warn!(target: "focus", "XOpenDisplay(:{}) failed", display_number);
 			return None;
 		}
+		// Xlib's error handler is process-global and its default implementation
+		// calls exit(). A window can always be destroyed between the moment a
+		// request is built and the moment the server processes it, so any
+		// X_SetInputFocus / X_ChangeProperty against a dying window is a fatal
+		// error waiting to happen — including the ones smithay's XWM issues on
+		// its own connection, which we cannot wrap individually. Install the
+		// silent handler once here so a late BadWindow is ignored rather than
+		// killing the whole server mid-session.
+		with_xlib(|loaded| {
+			let seterr = loaded.xseterrorhandler?;
+			unsafe { seterr(Some(silent_x11_error)) };
+			Some(())
+		});
+
 		let atoms = CachedAtoms::intern_all(dpy)?;
 
 		// Get the root window — needed for root property reads.

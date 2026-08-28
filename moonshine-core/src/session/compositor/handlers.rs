@@ -549,6 +549,27 @@ impl MoonshineCompositor {
 			meta.fullscreen = fullscreen;
 		}
 
+		// A client on its way out unfullscreens first, so re-focusing here races
+		// the window's destruction: XWM's X_SetInputFocus then lands on a dead
+		// window and Xlib's default error handler exits the process. Focus is
+		// recomputed by `unmapped_window`/`destroyed_window` anyway, so there is
+		// nothing to do for a window that is already gone.
+		//
+		// Deliberately not testing `is_mapped()`: it is also false *before* the
+		// initial map, when games request fullscreen from their map_request. That
+		// case must fall through — focus is set when the window maps, so skipping
+		// is harmless today, but only by coincidence, and it would silently
+		// swallow a genuine transition if that ordering ever changed.
+		if !window.alive() {
+			tracing::debug!(
+				target: "focus",
+				window_id = window.window_id(),
+				fullscreen,
+				"X11 window is destroyed; skipping focus re-evaluation"
+			);
+			return;
+		}
+
 		self.reevaluate_focus();
 	}
 
