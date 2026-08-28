@@ -5,6 +5,7 @@ use async_shutdown::ShutdownManager;
 use rtsp_types::Method;
 use rtsp_types::headers;
 use rtsp_types::headers::Transport;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -78,8 +79,7 @@ impl RtspServer {
 								.parse::<IpAddr>()
 								.map_err(|e| tracing::error!("Failed to parse address '{}': {}", server.address, e))?;
 							let socket_addr = SocketAddr::new(ip, server.rtsp_port);
-							let listener = TcpListener::bind(socket_addr)
-								.await
+							let listener = bind_rtsp_listener(socket_addr)
 								.map_err(|e| tracing::error!("Failed to bind to address {}: {}", socket_addr, e))?;
 
 							tracing::debug!("RTSP server listening on {}", socket_addr);
@@ -592,6 +592,29 @@ impl RtspServer {
 
 		Ok(())
 	}
+}
+
+/// Bind the RTSP listener, disabling `IPV6_V6ONLY` for IPv6 addresses so the
+/// single socket also accepts IPv4-mapped connections — the same treatment
+/// `webserver::bind_listener` already gives HTTP and HTTPS.
+///
+/// A bare `TcpListener::bind("::")` inherits the system default, which differs
+/// per platform: Linux defaults `net.ipv6.bindv6only=0` (dual-stack, so this is
+/// a no-op there), while FreeBSD defaults `net.inet6.ip6.v6only=1` (IPv6 only).
+/// On FreeBSD that left RTSP unreachable over IPv4 while HTTP/HTTPS stayed
+/// dual-stack, so Moonlight could complete `/launch` over one family and then
+/// have its RTSP connection refused by the kernel — no accept, no log line, and
+/// the session stuck at "waiting for RTSP ANNOUNCE" until it timed out.
+fn bind_rtsp_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+	let socket = Socket::new(Domain::for_address(address), Type::STREAM, Some(Protocol::TCP))?;
+	if address.is_ipv6() {
+		socket.set_only_v6(false)?;
+	}
+	socket.set_reuse_address(true)?;
+	socket.bind(&address.into())?;
+	socket.listen(1024)?;
+	socket.set_nonblocking(true)?;
+	TcpListener::from_std(socket.into())
 }
 
 fn rtsp_response(
