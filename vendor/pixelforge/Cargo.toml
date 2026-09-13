@@ -8,6 +8,10 @@ repository = "https://github.com/hgaiser/pixelforge"
 keywords = ["vulkan", "video", "encoding", "h264", "h265"]
 categories = ["multimedia::video", "graphics"]
 readme = "README.md"
+# Vendored into moonshine: the examples use the stripped [dev-dependencies],
+# so keep them out of the workspace's build targets. Cargo's workspace
+# `exclude` does not apply to path dependencies.
+autoexamples = false
 
 [features]
 default = []
