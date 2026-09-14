@@ -1,0 +1,16 @@
+[package]
+name = "tokio-enet"
+version = "0.1.1"
+edition = "2024"
+description = "A pure Rust implementation of the ENet reliable UDP networking library"
+license = "BSD-2-Clause"
+repository = "https://github.com/hgaiser/tokio-enet"
+keywords = ["enet", "networking", "udp", "reliable", "gamedev"]
+categories = ["network-programming", "game-development"]
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["net", "time", "rt", "macros"] }
+tracing = "0.1.44"
+thiserror = "2.0.18"
+socket2 = "0.6.4"
