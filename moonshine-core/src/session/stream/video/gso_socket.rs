@@ -44,7 +44,7 @@ impl AsFd for UdpGsoSocket {
 impl UdpGsoSocket {
 	/// Bind a socket to `address:port` and initialize its GSO state.
 	pub async fn new(address: &str, port: u16) -> Result<Self, ()> {
-		let socket = UdpSocket::bind((address, port))
+		let socket = crate::session::stream::bind_stream_socket(address, port)
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
