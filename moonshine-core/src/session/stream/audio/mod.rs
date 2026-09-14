@@ -244,7 +244,7 @@ impl AudioStream {
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
 
-		let udp_socket = UdpSocket::bind((address, config.port))
+		let udp_socket = crate::session::stream::bind_stream_socket(&address, config.port)
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
