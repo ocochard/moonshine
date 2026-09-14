@@ -11,6 +11,13 @@ exclude = [
 ]
 resolver = "2"
 
+# tokio-enet binds the control stream IPv6-only on a wildcard IPv6 address,
+# dropping IPv4 clients under FreeBSD's default net.inet6.ip6.v6only=1. Control
+# carries the session keepalive, so the whole session dies 60s in. Patched in
+# vendor/ until the fix lands upstream (hgaiser/tokio-enet).
+[patch.crates-io]
+tokio-enet = { path = "vendor/tokio-enet" }
+
 [workspace.package]
 version = "0.16.0"
 

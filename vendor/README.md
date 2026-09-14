@@ -24,6 +24,11 @@ changed in `moonshine-core/Cargo.toml`:
 | `smithay` | rev `0ff00983b6007257a7a161a4fe8b14a778e2ac8f` |
 | `inputtino` | default branch (Linux-only, never built here) |
 
+`tokio-enet` is the exception: a crates.io dependency, vendored to carry a
+patch rather than to stabilise a distfile, and wired in through
+`[patch.crates-io]` in the workspace root instead of a path dependency. See
+below.
+
 ### `smithay`
 
 Upstream v0.16.0 moved off the `hgaiser/smithay` fork to mainline
@@ -43,6 +48,33 @@ dependency and `Cargo.lock` gains ~110 never-compiled crates.
 Vendored at tag `v0.9.1`. `autoexamples = false` keeps its seven
 examples out of the build — they need the stripped `[dev-dependencies]`,
 and Cargo's workspace `exclude` does not apply to path dependencies.
+
+## Patched crates.io dependency
+
+### `tokio-enet`
+
+Vendored at published 0.1.1 (byte-identical to upstream git HEAD at the
+time) with one change in `src/socket.rs`: `EnetSocket::bind` now calls
+`set_only_v6(false)` on the IPv6 branch.
+
+Without it the socket inherits the system default for `IPV6_V6ONLY`,
+which is dual-stack on Linux (`net.ipv6.bindv6only=0`) but IPv6-only on
+FreeBSD and Windows (`net.inet6.ip6.v6only=1`). `IPV6_V6ONLY` is
+per-socket, so the other moonshine listeners clear it themselves; the
+control stream's bind lives inside this crate and cannot be reached from
+`HostConfig`. On a wildcard `"::"` bind under the FreeBSD default, an
+IPv4 client's control packets are dropped, and since control carries the
+session keepalive the whole session dies after 60s
+(`Stopping because we haven't received a ping for 60 seconds`).
+
+Verified by A/B at a fixed `net.inet6.ip6.v6only=1`: unpatched binds
+`udp6`, patched binds `udp46` (`sockstat -46` PROTO column).
+
+Wired in through `[patch.crates-io]` in the workspace root, not a path
+dependency — the other crates here are vendored to stabilise git
+distfiles, this one only to carry the patch. Drop the vendored copy and
+the workspace patch once the fix lands in an upstream release
+(<https://github.com/hgaiser/tokio-enet>).
 
 ## Dropped: `socket-pktinfo`
 
