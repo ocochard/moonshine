@@ -120,6 +120,14 @@ fn cache_set(pid: u32, app_id: u32) {
 /// The walk continues through parent processes until the app ID is found or
 /// the process tree is exhausted.
 fn get_appid_from_pid(pid: u32) -> u32 {
+	#[cfg(target_os = "freebsd")]
+	{
+		let app_id = freebsd_appid_from_env(pid);
+		if app_id != 0 {
+			return app_id;
+		}
+	}
+
 	let mut next_pid = pid;
 
 	tracing::trace!(target: "focus", pid, "get_appid_from_pid: starting process tree walk");
@@ -254,6 +262,30 @@ fn get_appid_from_pid(pid: u32) -> u32 {
 
 	tracing::debug!(target: "focus", "get_appid_from_pid: no app_id found, returning 0");
 	0
+}
+
+/// Read `SteamAppId` from the environment of `pid` via `kern.proc.env`.
+///
+/// Steam's reaper is no subreaper under the Linux ABI, so games are
+/// reparented to init and the process-tree walk never finds it.
+#[cfg(target_os = "freebsd")]
+fn freebsd_appid_from_env(pid: u32) -> u32 {
+	let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ENV, pid as libc::c_int];
+	let mut len: libc::size_t = 0;
+	// SAFETY: a null buffer asks sysctl for the required length only.
+	if unsafe { libc::sysctl(mib.as_mut_ptr(), 4, std::ptr::null_mut(), &mut len, std::ptr::null(), 0) } != 0 {
+		return 0;
+	}
+	let mut buf = vec![0u8; len];
+	// SAFETY: `buf` holds `len` writable bytes; sysctl updates `len`.
+	if unsafe { libc::sysctl(mib.as_mut_ptr(), 4, buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0) } != 0 {
+		return 0;
+	}
+	buf.truncate(len);
+	buf.split(|&b| b == 0)
+		.find_map(|var| var.strip_prefix(b"SteamAppId="))
+		.and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
+		.unwrap_or(0)
 }
 
 /// Scan a null-byte-separated cmdline for Steam app ID.
@@ -631,7 +663,9 @@ impl MoonshineCompositor {
 
 		// Steam mode makes STEAM_GAME authoritative; otherwise every window is
 		// its own app. Legacy Big Picture is Steam's own app id (769).
-		if self.steam_mode {
+		// Non-Linux hosts keep Steam's app ids so focus can follow Steam's
+		// focus control whenever Steam publishes it (see `e_strategy`).
+		if self.steam_mode || cfg!(not(target_os = "linux")) {
 			if steam_app_id != 0 {
 				app_id = steam_app_id;
 			}
@@ -1330,11 +1364,26 @@ impl MoonshineCompositor {
 	/// Gamescope: `DetermineAndApplyFocus()` strategy selection + `-e`.
 	fn e_strategy(&self) -> super::VirtualConnectorStrategy {
 		use super::VirtualConnectorStrategy;
-		if self.steam_mode && self.virtual_connector_strategy == VirtualConnectorStrategy::SingleApplication {
+		if (self.steam_mode || self.steam_publishes_focus_control())
+			&& self.virtual_connector_strategy == VirtualConnectorStrategy::SingleApplication
+		{
 			VirtualConnectorStrategy::SteamControlled
 		} else {
 			self.virtual_connector_strategy
 		}
+	}
+
+	/// Whether Steam is running and naming the window or apps to focus.
+	///
+	/// Non-Linux hosts default `steam_mode` off so directly launched apps get
+	/// focus; this hands focus to Steam once Steam is actually driving it.
+	fn steam_publishes_focus_control(&self) -> bool {
+		cfg!(not(target_os = "linux"))
+			&& self
+				.x11_focus
+				.as_ref()
+				.and_then(|xf| xf.read_focus_control())
+				.is_some_and(|f| f.window.is_some() || !f.app_ids.is_empty())
 	}
 
 	/// Keep the previous override painted under a nested popup so a dialog does
