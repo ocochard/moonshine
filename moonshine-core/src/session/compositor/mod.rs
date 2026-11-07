@@ -109,7 +109,9 @@ impl Default for CompositorConfig {
 		Self {
 			gpu: None,
 			hdr: true,
-			steam_mode: true,
+			// Non-Linux hosts run no native Steam, and Steam mode gives no
+			// input focus to apps it did not tag.
+			steam_mode: cfg!(target_os = "linux"),
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
 		}
