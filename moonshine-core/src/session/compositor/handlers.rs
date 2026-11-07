@@ -2224,33 +2224,10 @@ impl XWaylandShellHandler for MoonshineCompositor {
 					x11_focus.set_input_focus(focused_id);
 				}
 
-				// Also establish pointer focus now that the surface exists.
-				// surface_loc is the window's origin in compositor space (0,0
-				// for fullscreen windows), not the cursor position.
-				let window_loc = self
-					.space
-					.element_geometry(&focused_window)
-					.map(|g| g.loc.to_f64())
-					.unwrap_or_default();
-				let pointer = self.seat.get_pointer().expect("pointer should exist");
-				let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-				tracing::debug!(
-					target: "focus",
-					surface_id = ?wl_surface.id(),
-					cursor = ?self.cursor_position,
-					?window_loc,
-					"surface_associated: sending initial pointer motion event"
-				);
-				pointer.motion(
-					self,
-					Some((wl_surface.clone(), window_loc)),
-					&MotionEvent {
-						location: self.cursor_position,
-						serial,
-						time: InputTime::from_millis(self.clock.now().as_millis()),
-					},
-				);
-				pointer.frame(self);
+				// No pointer motion here: the cursor has not moved, and an
+				// absolute motion now can make SDL cache Xwayland's master
+				// pointer as absolute, which bounds its relative-mode deltas.
+				// Pointer focus follows on the next input event.
 			}
 		}
 	}
